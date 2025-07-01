@@ -1,0 +1,43 @@
+[package]
+name = "trading-ig"
+version = "0.1.0"
+edition = "2024"
+authors = ["Vendron"]
+description = "Rust wrapper for IG.com trading API with real-time streaming support"
+license = "Apache-2.0"
+repository = "https://github.com/vendron/trading-ig"
+keywords = ["ig", "trading", "finance", "lightstreamer", "streaming"]
+categories = ["finance", "api-bindings"]
+
+[[example]]
+name = "basic_usage"
+path = "../examples/basic_usage.rs"
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+url = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+log = { workspace = true }
+dashmap = { workspace = true }
+crossbeam = { workspace = true }
+
+# Local dependencies
+lightstreamer-client = { path = "../lightstreamer-client" }
+
+# IG-specific dependencies
+rust_decimal = "1.34"
+base64 = "0.21"
+hmac = "0.12"
+sha2 = "0.10"
+uuid = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true } 
