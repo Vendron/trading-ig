@@ -1,12 +1,14 @@
-//! Streaming functionality for IG Markets real-time data.
+//! Simplified streaming functionality for IG Markets real-time data.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
+use async_trait::async_trait;
+use log::{debug, info, warn, error};
 
 use lightstreamer_client::{
     Subscription, SubscriptionListener, ItemUpdate, SubscriptionMode
@@ -14,51 +16,64 @@ use lightstreamer_client::{
 
 use crate::client::IGStreamService;
 use crate::errors::{IGError, Result};
-use crate::utils::build_chart_item_name;
 
-/// StreamingManager handles real-time market data subscriptions.
+/// Callback trait for receiving raw ItemUpdates directly
+pub trait RawDataCallback: Send + Sync {
+    fn on_raw_update(&self, item_update: &ItemUpdate);
+}
+
+/// Simplified StreamingManager handles real-time market data subscriptions.
 /// 
-/// This class manages Lightstreamer subscriptions and processes incoming
-/// market data updates, maintaining a collection of Ticker objects for
-/// subscribed instruments.
-/// 
+/// This class manages Lightstreamer subscriptions and can either:
+/// 1. Process data into Ticker objects (legacy mode)
+/// 2. Send raw ItemUpdates directly to callbacks (low-latency mode)
 pub struct StreamingManager {
     /// Reference to the streaming service
-    service: Arc<Mutex<IGStreamService>>,
+    service: IGStreamService,
     /// Active subscriptions mapped by epic
-    subscriptions: Arc<Mutex<HashMap<String, Arc<Mutex<TickerSubscription>>>>>,
-    /// Ticker objects for real-time data
+    subscriptions: HashMap<String, TickerSubscription>,
+    /// Ticker objects for real-time data (legacy mode)
     tickers: Arc<Mutex<HashMap<String, Arc<Mutex<Ticker>>>>>,
-    /// Consumer for processing updates (async equivalent of Consumer thread)
-    _consumer_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    /// Update channel for async processing
-    update_sender: mpsc::UnboundedSender<ItemUpdate>,
+    /// Update channel for async processing (legacy mode)
+    update_sender: Option<mpsc::UnboundedSender<ItemUpdate>>,
+    /// Raw data callback for direct updates (low-latency mode)
+    raw_callback: Option<Arc<dyn RawDataCallback>>,
 }
 
 impl StreamingManager {
-    /// Create a new StreamingManager.
+    /// Create a new StreamingManager in legacy mode (with ticker aggregation).
     pub fn new(service: IGStreamService) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         
-        let subscriptions = Arc::new(Mutex::new(HashMap::new()));
         let tickers = Arc::new(Mutex::new(HashMap::new()));
         
         // Start consumer task
         let consumer_tickers = tickers.clone();
-        let consumer_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             Self::consumer_task(rx, consumer_tickers).await;
         });
         
         Self {
-            service: Arc::new(Mutex::new(service)),
-            subscriptions,
+            service,
+            subscriptions: HashMap::new(),
             tickers,
-            _consumer_handle: Arc::new(Mutex::new(Some(consumer_handle))),
-            update_sender: tx,
+            update_sender: Some(tx),
+            raw_callback: None,
         }
     }
 
-    /// Consumer task that processes ItemUpdate messages.
+    /// Create a new StreamingManager in low-latency mode (direct raw data).
+    pub fn new_with_raw_callback(service: IGStreamService, callback: Arc<dyn RawDataCallback>) -> Self {
+        Self {
+            service,
+            subscriptions: HashMap::new(),
+            tickers: Arc::new(Mutex::new(HashMap::new())),
+            update_sender: None,
+            raw_callback: Some(callback),
+        }
+    }
+
+    /// Consumer task that processes ItemUpdate messages (legacy mode only).
     async fn consumer_task(
         mut receiver: mpsc::UnboundedReceiver<ItemUpdate>,
         tickers: Arc<Mutex<HashMap<String, Arc<Mutex<Ticker>>>>>,
@@ -66,22 +81,18 @@ impl StreamingManager {
         log::info!("Consumer: Running");
         
         while let Some(item) = receiver.recv().await {
-            // Deal with each different type of update
+            // Process different data types efficiently (no verbose logging)
             if let Some(name) = item.item_name() {
                 if name.starts_with("CHART:") {
                     if let Err(e) = Self::handle_ticker_update(&item, &tickers).await {
-                        log::error!("Failed to handle ticker update: {}", e);
+                        log::error!("Consumer: Failed to handle ticker update: {}", e);
                     }
                 }
             }
-            
-            log::debug!("Consumer thread alive. queue length: processing");
         }
     }
 
-    /// Handle ticker update from ItemUpdate.
-    /// 
-    /// Python equivalent: Consumer._handle_ticker_update()
+    /// Handle ticker update from ItemUpdate (legacy mode only).
     async fn handle_ticker_update(
         item: &ItemUpdate,
         tickers: &Arc<Mutex<HashMap<String, Arc<Mutex<Ticker>>>>>,
@@ -92,120 +103,77 @@ impl StreamingManager {
             return Ok(());
         };
 
-        // Get or create ticker
-        let ticker_arc = {
+        // Get or create ticker with live reference
+        let ticker_ref = {
             let mut tickers_map = tickers.lock()
                 .map_err(|_| IGError::generic("Failed to acquire tickers lock"))?;
             
-            if !tickers_map.contains_key(&epic) {
-                let ticker = Arc::new(Mutex::new(Ticker::new(epic.clone())));
-                tickers_map.insert(epic.clone(), ticker.clone());
-                ticker
-            } else {
-                tickers_map[&epic].clone()
-            }
+            tickers_map.entry(epic.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(Ticker::new(epic.clone()))))
+                .clone()
         };
-
-        // Populate ticker with new data
-        {
-            let mut ticker = ticker_arc.lock()
-                .map_err(|_| IGError::generic("Failed to acquire ticker lock"))?;
-            ticker.populate(item.get_changed_fields())?;
-        }
+        
+        // Update the ticker with new data (fast, no logging overhead)
+        let mut ticker = ticker_ref.lock()
+            .map_err(|_| IGError::generic("Failed to acquire ticker lock"))?;
+        
+        ticker.populate(item.get_changed_fields())?;
 
         Ok(())
     }
 
     /// Start a tick subscription for the specified epic.
-    /// 
-    /// Python equivalent:
-    /// ```python
-    /// def start_tick_subscription(self, epic) -> TickerSubscription:
-    ///     tick_sub = TickerSubscription(epic)
-    ///     tick_sub.addListener(TickerListener(self._queue))
-    ///     self.service.subscribe(tick_sub)
-    ///     self._subs[epic] = tick_sub
-    ///     return tick_sub
-    /// ```
-    pub async fn start_tick_subscription(&self, epic: &str) -> Result<Arc<Mutex<TickerSubscription>>> {
+    pub async fn start_tick_subscription(&mut self, epic: &str) -> Result<()> {
         // Create TickerSubscription
         let mut tick_sub = TickerSubscription::new(epic.to_string());
         
-        // Add listener
-        let listener = Arc::new(TickerListener::new(self.update_sender.clone()));
+        // Add listener based on mode
+        let listener = if let Some(ref callback) = self.raw_callback {
+            // Low-latency mode: send directly to callback
+            TickerListener::new_with_raw_callback(callback.clone())
+        } else if let Some(ref sender) = self.update_sender {
+            // Legacy mode: send to consumer task
+            TickerListener::new_with_channel(sender.clone())
+        } else {
+            return Err(IGError::generic("StreamingManager not properly initialized"));
+        };
+        
         tick_sub.add_listener(listener)?;
         
-        let tick_sub_arc = Arc::new(Mutex::new(tick_sub));
-        
         // Subscribe via service
-        {
-            let service = self.service.lock()
-                .map_err(|_| IGError::generic("Failed to acquire service lock"))?;
-            // Note: In full implementation, this would call service.subscribe(subscription)
+        if let Some(lightstreamer_client) = self.service.lightstreamer_client() {
+            lightstreamer_client.subscribe(tick_sub.subscription().clone()).await
+                .map_err(|e| IGError::connection(format!("Failed to subscribe: {}", e)))?;
+            
             log::info!("Started tick subscription for epic: {}", epic);
+        } else {
+            return Err(IGError::session("No Lightstreamer client available"));
         }
         
         // Store subscription
-        {
-            let mut subs = self.subscriptions.lock()
-                .map_err(|_| IGError::generic("Failed to acquire subscriptions lock"))?;
-            subs.insert(epic.to_string(), tick_sub_arc.clone());
-        }
-
-        Ok(tick_sub_arc)
-    }
-
-    /// Stop tick subscription for the specified epic.
-    /// 
-    /// Python equivalent:
-    /// ```python
-    /// def stop_tick_subscription(self, epic):
-    ///     subscription = self._subs.pop(epic)
-    ///     self.service.unsubscribe(subscription)
-    /// ```
-    pub async fn stop_tick_subscription(&self, epic: &str) -> Result<()> {
-        // Remove and get subscription
-        let subscription = {
-            let mut subs = self.subscriptions.lock()
-                .map_err(|_| IGError::generic("Failed to acquire subscriptions lock"))?;
-            subs.remove(epic)
-        };
-
-        if let Some(_subscription) = subscription {
-            // Unsubscribe via service
-            {
-                let service = self.service.lock()
-                    .map_err(|_| IGError::generic("Failed to acquire service lock"))?;
-                // Note: In full implementation, this would call service.unsubscribe(subscription)
-            }
-
-            log::info!("Stopped tick subscription for epic: {}", epic);
-        }
+        self.subscriptions.insert(epic.to_string(), tick_sub);
 
         Ok(())
     }
 
-    /// Get ticker for the specified epic.
-    /// 
-    /// Python equivalent:
-    /// ```python
-    /// def ticker(self, epic):
-    ///     timeout = time.time() + 3
-    ///     while True:
-    ///         logger.debug("Waiting for ticker...")
-    ///         if epic in self._tickers or time.time() > timeout:
-    ///             break
-    ///         time.sleep(0.25)
-    ///     ticker = self._tickers[epic]
-    ///     if not ticker:
-    ///         raise Exception(f"No ticker found for {epic}, giving up")
-    ///     return ticker
-    /// ```
+    /// Stop tick subscription for the specified epic.
+    pub async fn stop_tick_subscription(&mut self, epic: &str) -> Result<()> {
+        if let Some(_subscription) = self.subscriptions.remove(epic) {
+            log::info!("Stopped tick subscription for epic: {}", epic);
+        }
+        Ok(())
+    }
+
+    /// Get ticker for the specified epic (legacy mode only).
     pub async fn ticker(&self, epic: &str) -> Result<Arc<Mutex<Ticker>>> {
-        // We won't have a ticker until at least one update is received from server,
-        // let's give it a few seconds (exactly like Python)
+        // This method only works in legacy mode
+        if self.raw_callback.is_some() {
+            return Err(IGError::generic("ticker() method not available in raw callback mode"));
+        }
+
+        // Wait for ticker to become available
         let mut attempts = 0;
-        let max_attempts = 12; // 12 * 250ms = 3 seconds
+        let max_attempts = 12;
         
         while attempts < max_attempts {
             log::debug!("Waiting for ticker...");
@@ -219,173 +187,86 @@ impl StreamingManager {
                 }
             }
             
-            // Wait 0.25 seconds
-            sleep(Duration::from_millis(250)).await;
             attempts += 1;
+            sleep(Duration::from_millis(250)).await;
         }
-
-        Err(IGError::invalid_market_data(format!("No ticker found for {}, giving up", epic)))
-    }
-
-    /// Stop all subscriptions and disconnect.
-    /// 
-    /// Python equivalent:
-    /// ```python
-    /// def stop_subscriptions(self):
-    ///     logger.info("Unsubscribing from all")
-    ///     self.service.unsubscribe_all()
-    ///     self.service.disconnect()
-    ///     if self._consumer_thread:
-    ///         self._consumer_thread.join(timeout=5)
-    ///         self._consumer_thread = None
-    /// ```
-    pub async fn stop_subscriptions(&self) -> Result<()> {
-        log::info!("Unsubscribing from all");
         
-        // Unsubscribe from all via service
-        {
-            let service = self.service.lock()
-                .map_err(|_| IGError::generic("Failed to acquire service lock"))?;
-            // Note: In full implementation, this would call:
-            // service.unsubscribe_all();
-            // service.disconnect();
-        }
+        Err(IGError::generic(format!("No ticker found for {}, giving up", epic)))
+    }
 
-        // Clear local collections
-        {
-            let mut subs = self.subscriptions.lock()
-                .map_err(|_| IGError::generic("Failed to acquire subscriptions lock"))?;
-            subs.clear();
+    /// Stop all subscriptions.
+    pub async fn stop_subscriptions(&mut self) -> Result<()> {
+        log::info!("Unsubscribing from all subscriptions");
+        
+        let epics: Vec<String> = self.subscriptions.keys().cloned().collect();
+        for epic in epics {
+            if let Err(e) = self.stop_tick_subscription(&epic).await {
+                log::error!("Failed to stop subscription for {}: {}", epic, e);
+            }
         }
-
-        {
-            let mut tickers = self.tickers.lock()
-                .map_err(|_| IGError::generic("Failed to acquire tickers lock"))?;
-            tickers.clear();
-        }
-
+        
         Ok(())
-    }
-
-    /// Property accessor for service (matches Python @property service)
-    pub fn service(&self) -> &Arc<Mutex<IGStreamService>> {
-        &self.service
-    }
-
-    /// Property accessor for tickers (matches Python @property tickers)
-    pub fn tickers(&self) -> &Arc<Mutex<HashMap<String, Arc<Mutex<Ticker>>>>> {
-        &self.tickers
     }
 }
 
-/// TickerSubscription represents a subscription for tick prices.
-/// 
-/// Python equivalent:
-/// ```python
-/// class TickerSubscription(Subscription):
-///     TICKER_FIELDS = [
-///         "BID", "OFR", "LTP", "LTV", "TTV", "UTM",
-///         "DAY_OPEN_MID", "DAY_NET_CHG_MID", "DAY_PERC_CHG_MID", 
-///         "DAY_HIGH", "DAY_LOW",
-///     ]
-///     def __init__(self, epic: str):
-///         super().__init__(
-///             mode="DISTINCT",
-///             items=[f"CHART:{epic}:TICK"],
-///             fields=self.TICKER_FIELDS,
-///         )
-/// ```
+/// Simplified TickerSubscription represents a subscription for tick prices.
 pub struct TickerSubscription {
-    /// The underlying Lightstreamer subscription
-    subscription: Subscription,
+    /// The underlying Lightstreamer subscription (wrapped for thread safety)
+    subscription: Arc<std::sync::Mutex<Subscription>>,
     /// Epic identifier
     epic: String,
 }
 
 impl TickerSubscription {
-    /// Ticker fields exactly matching Python TICKER_FIELDS
     pub const TICKER_FIELDS: &'static [&'static str] = &[
-        "BID",
-        "OFR", 
-        "LTP",
-        "LTV",
-        "TTV",
-        "UTM",
-        "DAY_OPEN_MID",
-        "DAY_NET_CHG_MID",
-        "DAY_PERC_CHG_MID",
-        "DAY_HIGH",
-        "DAY_LOW",
+        "BID",                    // Bid price
+        "OFR",                    // Offer/Ask price  
+        "LTP",                    // Last traded price
+        "LTV",                    // Last traded volume
+        "TTV",                    // Total traded volume (incremental)
+        "UTM",                    // Update timestamp (Unix milliseconds)
+        "DAY_OPEN_MID",          // Day opening mid price
+        "DAY_NET_CHG_MID",       // Day net change (mid price)
+        "DAY_PERC_CHG_MID",      // Day percentage change (mid price)
+        "DAY_HIGH",              // Day high price
+        "DAY_LOW"                // Day low price
     ];
 
     /// Create a new TickerSubscription.
-    /// 
-    /// Python equivalent:
-    /// ```python
-    /// def __init__(self, epic: str):
-    ///     super().__init__(
-    ///         mode="DISTINCT",
-    ///         items=[f"CHART:{epic}:TICK"],
-    ///         fields=self.TICKER_FIELDS,
-    ///     )
-    /// ```
     pub fn new(epic: String) -> Self {
-        let item_name = build_chart_item_name(&epic);
-        let fields: Vec<String> = Self::TICKER_FIELDS.iter().map(|&s| s.to_string()).collect();
-        
         let subscription = Subscription::new(
-            SubscriptionMode::Distinct, // "DISTINCT" mode like Python
-            vec![item_name],
-            fields,
+            SubscriptionMode::Distinct,                    // DISTINCT mode
+            vec![format!("CHART:{}:TICK", epic)],         // CHART subscription
+            Self::TICKER_FIELDS.iter().map(|s| s.to_string()).collect(),  // All fields
         );
 
         Self {
-            subscription,
+            subscription: Arc::new(std::sync::Mutex::new(subscription)),
             epic,
         }
     }
 
-    /// Get the epic identifier
+    /// Get the epic identifier.
     pub fn epic(&self) -> &str {
         &self.epic
     }
 
-    /// Add a listener to the subscription
-    pub fn add_listener(&mut self, listener: Arc<dyn SubscriptionListener>) -> Result<()> {
-        self.subscription.add_listener(listener)
-            .map_err(|e| IGError::generic(&format!("Failed to add listener: {}", e)))
+    /// Add a listener to the subscription.
+    pub fn add_listener(&mut self, listener: TickerListener) -> Result<()> {
+        let mut subscription = self.subscription.lock()
+            .map_err(|_| IGError::generic("Failed to acquire subscription lock"))?;
+        subscription.add_listener(Arc::new(listener));
+        Ok(())
     }
 
-    /// Get the underlying subscription (for service.subscribe() calls)
-    pub fn subscription(&self) -> &Subscription {
+    /// Get reference to the subscription (for lightstreamer client).
+    pub fn subscription(&self) -> &Arc<std::sync::Mutex<Subscription>> {
         &self.subscription
-    }
-
-    /// Get mutable access to underlying subscription
-    pub fn subscription_mut(&mut self) -> &mut Subscription {
-        &mut self.subscription
     }
 }
 
-/// Ticker represents real-time market data for a specific instrument.
-/// 
-/// Python equivalent:
-/// ```python
-/// @dataclass
-/// class Ticker(StreamObject):
-///     epic: str
-///     timestamp: datetime = None
-///     bid: float = nan
-///     offer: float = nan
-///     last_traded_price: float = nan
-///     last_traded_volume: int = 0
-///     incr_volume: int = 0
-///     day_open_mid: float = nan
-///     day_net_change_mid: float = nan
-///     day_percent_change_mid: float = nan
-///     day_high: float = nan
-///     day_low: float = nan
-/// ```
+/// Ticker represents real-time price data for an instrument.
+#[derive(Debug, Clone)]
 pub struct Ticker {
     /// Epic identifier
     epic: String,
@@ -414,13 +295,7 @@ pub struct Ticker {
 }
 
 impl Ticker {
-    /// Create a new Ticker for the specified epic.
-    /// 
-    /// Python equivalent:
-    /// ```python
-    /// def __init__(self, epic):
-    ///     self.epic = epic
-    /// ```
+    /// Create a new Ticker.
     pub fn new(epic: String) -> Self {
         Self {
             epic,
@@ -438,106 +313,269 @@ impl Ticker {
         }
     }
 
-    /// Get the epic identifier
+    /// Get the epic identifier.
     pub fn epic(&self) -> &str {
         &self.epic
     }
 
-    /// Extract epic from item name.
-    /// 
-    /// Python equivalent:
-    /// ```python
-    /// @classmethod
-    /// def identifier(cls, name):
-    ///     epic = name.split(":")[1]
-    ///     return epic
-    /// ```
+    /// Extract epic from item name 
+    /// Example: "CHART:IX.D.SPTRD.DAILY.IP:TICK".
     pub fn identifier(item_name: &str) -> String {
-        // Split by ':' and get the second part (epic)
-        // CHART:EPIC:TICK -> EPIC
-        let parts: Vec<&str> = item_name.split(':').collect();
-        if parts.len() >= 2 {
-            parts[1].to_string()
-        } else {
-            item_name.to_string()
-        }
+        // Extract epic from "CHART:EPIC:TICK" format
+        item_name.split(':')
+            .nth(1)
+            .unwrap_or("")
+            .to_string()
     }
 
-    /// Populate ticker with field values from ItemUpdate.
-    /// 
-    /// Python equivalent:
-    /// ```python
-    /// def populate(self, values):
-    ///     self.set_timestamp_by_name("timestamp", values, "UTM")
-    ///     self.set_by_name("bid", values, "BID", float)
-    ///     self.set_by_name("offer", values, "OFR", float)
-    ///     self.set_by_name("last_traded_price", values, "LTP", float)
-    ///     self.set_by_name("last_traded_volume", values, "LTV", int)
-    ///     self.set_by_name("incr_volume", values, "TTV", int)
-    ///     self.set_by_name("day_open_mid", values, "DAY_OPEN_MID", float)
-    ///     self.set_by_name("day_net_change_mid", values, "DAY_NET_CHG_MID", float)
-    ///     self.set_by_name("day_percent_change_mid", values, "DAY_PERC_CHG_MID", float)
-    ///     self.set_by_name("day_high", values, "DAY_HIGH", float)
-    ///     self.set_by_name("day_low", values, "DAY_LOW", float)
-    /// ```
+    /// Populate ticker with latest data from Lightstreamer.
+    /// Implements Python-style state management: merges deltas with previous state.
     pub fn populate(&mut self, values: &lightstreamer_client::FieldMap) -> Result<()> {
-        // Set timestamp from UTM field (Unix timestamp in milliseconds)
-        self.set_timestamp_by_name(values, "UTM");
+        // Python-style state management: merge new values with existing state
+        // Only update fields that have actually changed (non-null values)
+        // Empty/null values in Lightstreamer protocol mean "no change, keep previous"
         
-        // Set decimal fields
-        Self::set_decimal_by_name(&mut self.bid, values, "BID");
-        Self::set_decimal_by_name(&mut self.offer, values, "OFR");
-        Self::set_decimal_by_name(&mut self.last_traded_price, values, "LTP");
-        Self::set_decimal_by_name(&mut self.day_open_mid, values, "DAY_OPEN_MID");
-        Self::set_decimal_by_name(&mut self.day_net_change_mid, values, "DAY_NET_CHG_MID");
-        Self::set_decimal_by_name(&mut self.day_percent_change_mid, values, "DAY_PERC_CHG_MID");
-        Self::set_decimal_by_name(&mut self.day_high, values, "DAY_HIGH");
-        Self::set_decimal_by_name(&mut self.day_low, values, "DAY_LOW");
+        use lightstreamer_client::FieldValue;
         
-        // Set integer fields
-        Self::set_integer_by_name(&mut self.last_traded_volume, values, "LTV");
-        Self::set_integer_by_name(&mut self.incr_volume, values, "TTV");
+        // UTM (timestamp) - only if changed
+        if let Some(FieldValue::Integer(timestamp_ms)) = values.get("UTM") {
+            self.timestamp = Some(DateTime::from_timestamp(timestamp_ms / 1000, 0).unwrap_or_default());
+        }
+
+        // BID - only if changed (Python behavior: null = no change)
+        match values.get("BID") {
+            Some(FieldValue::Float(bid_float)) => {
+                self.bid = Some(Decimal::from_f64_retain(*bid_float).unwrap_or_default());
+            }
+            Some(FieldValue::String(bid_str)) => {
+                if let Ok(bid_float) = bid_str.parse::<f64>() {
+                    self.bid = Some(Decimal::from_f64_retain(bid_float).unwrap_or_default());
+                }
+            }
+            Some(FieldValue::Integer(bid_int)) => {
+                self.bid = Some(Decimal::from_i64(*bid_int).unwrap_or_default());
+            }
+            Some(FieldValue::Null) => {
+                // Null means "no change" - keep existing value (Python behavior)
+                // self.bid unchanged
+            }
+            None => {
+                // Field not present in update - keep existing value
+                // self.bid unchanged
+            }
+        }
+
+        // OFR (Offer/Ask) - only if changed
+        match values.get("OFR") {
+            Some(FieldValue::Float(offer_float)) => {
+                self.offer = Some(Decimal::from_f64_retain(*offer_float).unwrap_or_default());
+            }
+            Some(FieldValue::String(offer_str)) => {
+                if let Ok(offer_float) = offer_str.parse::<f64>() {
+                    self.offer = Some(Decimal::from_f64_retain(offer_float).unwrap_or_default());
+                }
+            }
+            Some(FieldValue::Integer(offer_int)) => {
+                self.offer = Some(Decimal::from_i64(*offer_int).unwrap_or_default());
+            }
+            Some(FieldValue::Null) => {
+                // Null means "no change" - keep existing value
+                // self.offer unchanged
+            }
+            None => {
+                // Field not present in update - keep existing value
+                // self.offer unchanged
+            }
+        }
+
+        // LTP (Last Traded Price) - only if changed
+        match values.get("LTP") {
+            Some(FieldValue::Float(ltp_float)) => {
+                self.last_traded_price = Some(Decimal::from_f64_retain(*ltp_float).unwrap_or_default());
+            }
+            Some(FieldValue::String(ltp_str)) => {
+                if let Ok(ltp_float) = ltp_str.parse::<f64>() {
+                    self.last_traded_price = Some(Decimal::from_f64_retain(ltp_float).unwrap_or_default());
+                }
+            }
+            Some(FieldValue::Integer(ltp_int)) => {
+                self.last_traded_price = Some(Decimal::from_i64(*ltp_int).unwrap_or_default());
+            }
+            Some(FieldValue::Null) => {
+                // Null means "no change" - keep existing value
+                // self.last_traded_price unchanged
+            }
+            None => {
+                // Field not present in update - keep existing value
+                // self.last_traded_price unchanged
+            }
+        }
+
+        // LTV (Last Traded Volume) - only if changed
+        match values.get("LTV") {
+            Some(FieldValue::Integer(ltv_int)) => {
+                self.last_traded_volume = Some(*ltv_int);
+            }
+            Some(FieldValue::String(ltv_str)) => {
+                if let Ok(ltv_int) = ltv_str.parse::<i64>() {
+                    self.last_traded_volume = Some(ltv_int);
+                }
+            }
+            Some(FieldValue::Float(ltv_float)) => {
+                self.last_traded_volume = Some(*ltv_float as i64);
+            }
+            Some(FieldValue::Null) => {
+                // Null means "no change" - keep existing value
+                // self.last_traded_volume unchanged
+            }
+            None => {
+                // Field not present in update - keep existing value
+                // self.last_traded_volume unchanged
+            }
+        }
+
+        // TTV (Total Traded Volume / Incremental) - only if changed
+        match values.get("TTV") {
+            Some(FieldValue::Integer(ttv_int)) => {
+                self.incr_volume = Some(*ttv_int);
+            }
+            Some(FieldValue::String(ttv_str)) => {
+                if let Ok(ttv_int) = ttv_str.parse::<i64>() {
+                    self.incr_volume = Some(ttv_int);
+                }
+            }
+            Some(FieldValue::Float(ttv_float)) => {
+                self.incr_volume = Some(*ttv_float as i64);
+            }
+            Some(FieldValue::Null) => {
+                // Null means "no change" - keep existing value
+                // self.incr_volume unchanged
+            }
+            None => {
+                // Field not present in update - keep existing value
+                // self.incr_volume unchanged
+            }
+        }
+
+        // DAY_OPEN_MID - only if changed
+        match values.get("DAY_OPEN_MID") {
+            Some(FieldValue::Float(open_float)) => {
+                self.day_open_mid = Some(Decimal::from_f64_retain(*open_float).unwrap_or_default());
+            }
+            Some(FieldValue::String(open_str)) => {
+                if let Ok(open_float) = open_str.parse::<f64>() {
+                    self.day_open_mid = Some(Decimal::from_f64_retain(open_float).unwrap_or_default());
+                }
+            }
+            Some(FieldValue::Integer(open_int)) => {
+                self.day_open_mid = Some(Decimal::from_i64(*open_int).unwrap_or_default());
+            }
+            Some(FieldValue::Null) => {
+                // Null means "no change" - keep existing value
+                // self.day_open_mid unchanged
+            }
+            None => {
+                // Field not present in update - keep existing value
+                // self.day_open_mid unchanged
+            }
+        }
+
+        // DAY_NET_CHG_MID - only if changed
+        match values.get("DAY_NET_CHG_MID") {
+            Some(FieldValue::Float(net_chg_float)) => {
+                self.day_net_change_mid = Some(Decimal::from_f64_retain(*net_chg_float).unwrap_or_default());
+            }
+            Some(FieldValue::Integer(net_chg_int)) => {
+                self.day_net_change_mid = Some(Decimal::from_i64(*net_chg_int).unwrap_or_default());
+            }
+            Some(FieldValue::String(net_chg_str)) => {
+                if let Ok(net_chg_float) = net_chg_str.parse::<f64>() {
+                    self.day_net_change_mid = Some(Decimal::from_f64_retain(net_chg_float).unwrap_or_default());
+                }
+            }
+            Some(FieldValue::Null) => {
+                // Null means "no change" - keep existing value
+                // self.day_net_change_mid unchanged
+            }
+            None => {
+                // Field not present in update - keep existing value
+                // self.day_net_change_mid unchanged
+            }
+        }
+
+        // DAY_PERC_CHG_MID - only if changed
+        match values.get("DAY_PERC_CHG_MID") {
+            Some(FieldValue::Float(perc_chg_float)) => {
+                self.day_percent_change_mid = Some(Decimal::from_f64_retain(*perc_chg_float).unwrap_or_default());
+            }
+            Some(FieldValue::String(perc_chg_str)) => {
+                if let Ok(perc_chg_float) = perc_chg_str.parse::<f64>() {
+                    self.day_percent_change_mid = Some(Decimal::from_f64_retain(perc_chg_float).unwrap_or_default());
+                }
+            }
+            Some(FieldValue::Integer(perc_chg_int)) => {
+                self.day_percent_change_mid = Some(Decimal::from_i64(*perc_chg_int).unwrap_or_default());
+            }
+            Some(FieldValue::Null) => {
+                // Null means "no change" - keep existing value
+                // self.day_percent_change_mid unchanged
+            }
+            None => {
+                // Field not present in update - keep existing value
+                // self.day_percent_change_mid unchanged
+            }
+        }
+
+        // DAY_HIGH - only if changed
+        match values.get("DAY_HIGH") {
+            Some(FieldValue::Float(high_float)) => {
+                self.day_high = Some(Decimal::from_f64_retain(*high_float).unwrap_or_default());
+            }
+            Some(FieldValue::String(high_str)) => {
+                if let Ok(high_float) = high_str.parse::<f64>() {
+                    self.day_high = Some(Decimal::from_f64_retain(high_float).unwrap_or_default());
+                }
+            }
+            Some(FieldValue::Integer(high_int)) => {
+                self.day_high = Some(Decimal::from_i64(*high_int).unwrap_or_default());
+            }
+            Some(FieldValue::Null) => {
+                // Null means "no change" - keep existing value
+                // self.day_high unchanged
+            }
+            None => {
+                // Field not present in update - keep existing value
+                // self.day_high unchanged
+            }
+        }
+
+        // DAY_LOW - only if changed
+        match values.get("DAY_LOW") {
+            Some(FieldValue::Float(low_float)) => {
+                self.day_low = Some(Decimal::from_f64_retain(*low_float).unwrap_or_default());
+            }
+            Some(FieldValue::String(low_str)) => {
+                if let Ok(low_float) = low_str.parse::<f64>() {
+                    self.day_low = Some(Decimal::from_f64_retain(low_float).unwrap_or_default());
+                }
+            }
+            Some(FieldValue::Integer(low_int)) => {
+                self.day_low = Some(Decimal::from_i64(*low_int).unwrap_or_default());
+            }
+            Some(FieldValue::Null) => {
+                // Null means "no change" - keep existing value
+                // self.day_low unchanged
+            }
+            None => {
+                // Field not present in update - keep existing value
+                // self.day_low unchanged
+            }
+        }
 
         Ok(())
     }
 
-    /// Set timestamp field from UTM value (like Python set_timestamp_by_name)
-    fn set_timestamp_by_name(&mut self, values: &lightstreamer_client::FieldMap, key: &str) {
-        if let Some(field_value) = values.get(key) {
-            if let lightstreamer_client::FieldValue::String(text) = field_value {
-                if let Ok(timestamp_ms) = text.parse::<i64>() {
-                    // Convert milliseconds to seconds for DateTime::from_timestamp
-                    if let Some(dt) = DateTime::from_timestamp(timestamp_ms / 1000, ((timestamp_ms % 1000) * 1_000_000) as u32) {
-                        self.timestamp = Some(dt);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Set decimal field from string value (like Python set_by_name with float)
-    fn set_decimal_by_name(field: &mut Option<Decimal>, values: &lightstreamer_client::FieldMap, key: &str) {
-        if let Some(field_value) = values.get(key) {
-            if let lightstreamer_client::FieldValue::String(text) = field_value {
-                if let Ok(decimal_val) = text.parse::<Decimal>() {
-                    *field = Some(decimal_val);
-                }
-            }
-        }
-    }
-
-    /// Set integer field from string value (like Python set_by_name with int)
-    fn set_integer_by_name(field: &mut Option<i64>, values: &lightstreamer_client::FieldMap, key: &str) {
-        if let Some(field_value) = values.get(key) {
-            if let lightstreamer_client::FieldValue::String(text) = field_value {
-                if let Ok(int_val) = text.parse::<i64>() {
-                    *field = Some(int_val);
-                }
-            }
-        }
-    }
-
-    // Getter methods for all fields (like Python properties)
+    // Simplified getter methods (no need for complex Option handling)
     
     pub fn timestamp(&self) -> Option<DateTime<Utc>> {
         self.timestamp
@@ -584,36 +622,61 @@ impl Ticker {
     }
 }
 
-/// TickerListener implements SubscriptionListener for handling ticker updates.
+/// TickerListener forwards updates either to a channel (legacy) or raw callback (low-latency).
 pub struct TickerListener {
-    /// Sender for forwarding updates
-    update_sender: mpsc::UnboundedSender<ItemUpdate>,
+    /// Mode of operation
+    mode: TickerListenerMode,
+}
+
+/// Mode enum for TickerListener
+enum TickerListenerMode {
+    /// Legacy mode: send to channel for processing
+    Channel(mpsc::UnboundedSender<ItemUpdate>),
+    /// Low-latency mode: call raw callback directly
+    RawCallback(Arc<dyn RawDataCallback>),
 }
 
 impl TickerListener {
-    /// Create a new TickerListener.
-    pub fn new(update_sender: mpsc::UnboundedSender<ItemUpdate>) -> Self {
-        Self { update_sender }
+    /// Create a new TickerListener with channel (legacy mode).
+    pub fn new_with_channel(update_sender: mpsc::UnboundedSender<ItemUpdate>) -> Self {
+        Self { 
+            mode: TickerListenerMode::Channel(update_sender)
+        }
+    }
+
+    /// Create a new TickerListener with raw callback (low-latency mode).
+    pub fn new_with_raw_callback(callback: Arc<dyn RawDataCallback>) -> Self {
+        Self {
+            mode: TickerListenerMode::RawCallback(callback)
+        }
     }
 }
 
 #[async_trait]
 impl SubscriptionListener for TickerListener {
     async fn on_subscription(&self) {
-        log::info!("TickerListener: onSubscription()");
+        log::info!("TickerListener onSubscription()");
     }
 
     async fn on_subscription_error(&self, code: i32, message: &str) {
-        log::error!("TickerListener: onSubscriptionError({}, {})", code, message);
+        log::error!("TickerListener onSubscriptionError(): '{}' {}", code, message);
     }
 
     async fn on_unsubscription(&self) {
-        log::info!("TickerListener: onUnsubscription()");
+        log::info!("TickerListener onUnsubscription()");
     }
 
     async fn on_item_update(&self, update: &ItemUpdate) {
-        // Forward update to StreamingManager
-        let _ = self.update_sender.send(update.clone());
+        match &self.mode {
+            TickerListenerMode::Channel(sender) => {
+                // Legacy mode: send to channel for processing
+                let _ = sender.send(update.clone());
+            }
+            TickerListenerMode::RawCallback(callback) => {
+                // Low-latency mode: call callback directly
+                callback.on_raw_update(update);
+            }
+        }
     }
 }
 

@@ -1,11 +1,11 @@
 [package]
 name = "trading-ig"
 version = "0.1.0"
-edition = "2024"
-authors = ["Vendron"]
-description = "Rust wrapper for IG.com trading API with real-time streaming support"
-license = "Apache-2.0"
-repository = "https://github.com/vendron/trading-ig"
+edition = "2021"
+authors = ["Trading IG Rust Team"]
+description = "Rust implementation of trading_ig - IG Markets trading library with real-time streaming support"
+license = "MIT"
+repository = "https://github.com/trading-ig/trading-ig"
 keywords = ["ig", "trading", "finance", "lightstreamer", "streaming"]
 categories = ["finance", "api-bindings"]
 
@@ -40,4 +40,5 @@ sha2 = "0.10"
 uuid = { workspace = true }
 
 [dev-dependencies]
-env_logger = { workspace = true } 
+env_logger = { workspace = true }
+dotenv = { workspace = true } 

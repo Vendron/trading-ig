@@ -1,6 +1,7 @@
 //! Error types for the IG Markets trading library.
 
 use thiserror::Error;
+use std::fmt;
 
 pub type Result<T> = std::result::Result<T, IGError>;
 
@@ -66,6 +67,10 @@ pub enum IGError {
     /// Generic errors
     #[error("Error: {message}")]
     Generic { message: String },
+
+    /// Unsupported operation errors
+    #[error("Unsupported operation: {message}")]
+    Unsupported { message: String },
 }
 
 impl IGError {
@@ -141,6 +146,21 @@ impl IGError {
         }
     }
 
+    /// Create an unsupported operation error
+    pub fn unsupported<M: Into<String>>(message: M) -> Self {
+        Self::Unsupported {
+            message: message.into(),
+        }
+    }
+
+    /// Create an API error with status code
+    pub fn api_error(status_code: u16, message: String) -> Self {
+        Self::Api {
+            code: status_code.to_string(),
+            message,
+        }
+    }
+
     /// Check if error is related to authentication
     pub fn is_authentication(&self) -> bool {
         matches!(
@@ -186,7 +206,8 @@ impl IGError {
             Self::Configuration { message } => message,
             Self::Connection { message } => message,
             Self::Generic { message } => message,
+            Self::Unsupported { message } => message,
             _ => "Unknown error",
         }
     }
-} 
+}
